@@ -11,6 +11,10 @@
 struct convparams {
 	uint32_t gc_thres_lines;
 	uint32_t gc_thres_lines_high;
+	
+	uint32_t gc_thres_rus;                       //update
+	uint32_t gc_thres_rus_high;		     //update
+
 	bool enable_gc_delay;
 
 	double op_area_pcent;
@@ -66,6 +70,12 @@ struct conv_ftl {
 	struct line_mgmt lm;
 	struct write_flow_control wfc;
 };
+
+enum {                                          // update~ 
+        RU_TYPE_NORMAL = 0,
+        RU_TYPE_II_GC = 1,
+        RU_TYPE_PI_GC = 2,
+};                                                      // ~update
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
 			 uint32_t cpu_nr_dispatcher);

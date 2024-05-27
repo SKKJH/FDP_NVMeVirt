@@ -152,6 +152,21 @@ struct nvme_lbaf {
 	__u8 rp;
 };
 
+enum {  //update                
+    NVME_RUHA_UNUSED = 0,           
+    NVME_RUHA_HOST = 1,
+    NVME_RUHA_CTRL = 2,
+};      //update
+
+enum {  //update
+    NVME_OACS_SECURITY      = 1 << 0,
+    NVME_OACS_FORMAT        = 1 << 1,
+    NVME_OACS_FW            = 1 << 2,
+    NVME_OACS_NS_MGMT       = 1 << 3,
+    NVME_OACS_DIRECTIVES    = 1 << 5,
+    NVME_OACS_DBBUF         = 1 << 8,
+};      //update
+
 struct nvme_id_ns {
 	__le64 nsze;
 	__le64 ncap;
@@ -254,6 +269,121 @@ struct nvme_effects_log {
 	__u8 resv[2048];
 };
 
+struct NvmeDirectiveIdentify { // update~
+    uint8_t supported;
+    uint8_t unused1[31];
+    uint8_t enabled;
+    uint8_t unused33[31];
+    uint8_t persistent;
+    uint8_t unused65[31];
+    uint8_t rsvd64[4000];
+};
+
+enum {
+    NVME_DIRECTIVE_IDENTIFY       = 0x0,
+    NVME_DIRECTIVE_STREAM         = 0x1,
+    NVME_DIRECTIVE_DATA_PLACEMENT = 0x2,
+};
+
+enum {
+    NVME_DIRECTIVE_RETURN_PARAMS = 0x1,
+};
+
+struct NvmeFdpConfsHdr {
+    uint16_t num_confs;
+    uint8_t  version;
+    uint8_t  rsvd3;
+    uint32_t size;
+    uint8_t  rsvd8[8];
+} ;
+
+struct NvmeRuhDescr {
+    uint8_t ruht;
+    uint8_t rsvd1[3];
+};
+
+struct NvmeFdpDescrHdr {
+    uint16_t descr_size;
+    uint8_t  fdpa;
+    uint8_t  vss;
+    uint32_t nrg;
+    uint16_t nruh;
+    uint16_t maxpids;
+    uint32_t nnss;                                                                         
+    uint64_t runs;
+    uint32_t erutl;
+    uint8_t  rsvd28[36];
+} ;
+
+enum {
+    NVME_RUHT_INITIALLY_ISOLATED = 1,
+    NVME_RUHT_PERSISTENTLY_ISOLATED = 2,
+};
+
+
+struct NvmeFdpStatsLog {
+    uint64_t hbmw[2];
+    uint64_t mbmw[2];
+    uint64_t mbe[2];
+    uint8_t  rsvd48[16];
+};
+
+struct NvmeFdpEventsLog {
+    uint32_t num_events;
+    uint8_t  rsvd4[60];
+} ;
+
+enum {
+    FDPEF_PIV = 1 << 0,
+    FDPEF_NSIDV = 1 << 1,
+    FDPEF_LV = 1 << 2,
+};
+
+struct NvmePhidList {
+    uint16_t nnruhd;
+    uint8_t  rsvd2[6];
+} ;
+
+struct NvmePhidDescr {
+    uint8_t  ruht;
+    uint8_t  rsvd1;
+    uint16_t ruhid;
+};
+
+struct NvmeFdpEventDescr {
+    uint8_t evt;
+    uint8_t evta;
+};
+
+enum {
+    NVME_IOMR_MO_NOP = 0x00,
+    NVME_IOMR_MO_RUH_STATUS = 0x01,
+    NVME_IOMR_MO_VENDOR_SPECIFIC = 0xFF,
+};
+
+struct NvmeRuhStatus {
+    uint8_t  rsvd0[14];
+    uint16_t nruhsd;
+} ;
+
+struct NvmeRuhStatusDescr {
+    uint16_t pid;
+    uint16_t ruhid;
+    uint32_t earutr;
+    uint64_t ruamw;
+    uint8_t  rsvd16[16];
+};
+
+/* REG32(NVME_IOMS, 0x0)
+    FIELD(NVME_IOMS, MO, 0, 8)
+    FIELD(NVME_IOMS, MOS, 16, 16); */
+
+enum {
+    NVME_IOMS_MO_NOP = 0x0,
+    NVME_IOMS_MO_RUH_UPDATE = 0x1,
+};                                                                                                              //~update
+
+
 enum {
 	NVME_SMART_CRIT_SPARE = 1 << 0,
 	NVME_SMART_CRIT_TEMPERATURE = 1 << 1,
@@ -328,6 +458,9 @@ struct nvme_reservation_status {
 	op(nvme_cmd_kv_iter_read, 0xB2) \
 	op(nvme_cmd_kv_exist, 0xB3) \
 	op(nvme_cmd_kv_batch, 0x85) \
+	op(nvme_cmd_io_mgmt_recv, 0x12) \
+	op(nvme_cmd_copy, 0x19) \
+	op(nvme_cmd_io_mgmt_send, 0x1d) \
 
 #define ENUM_NVME_OP(name, value) name = value,
 #define STRING_NVME_OP(name, value) [name] = #name,
@@ -367,7 +500,10 @@ struct nvme_rw_command {
 	__le64 slba;
 	__le16 length;
 	__le16 control;
-	__le32 dsmgmt;
+	//__le32 dsmgmt;
+        __u8 dsmgmt;
+      	__u8 rsvd;
+      	__u16 dspec;
 	__le32 reftag;
 	__le16 apptag;
 	__le16 appmask;
@@ -511,10 +647,16 @@ enum {
 	NVME_LOG_DEVICE_SELF_TEST = 0x06,
 	NVME_LOG_TELEMETRY_HOST = 0x07,
 	NVME_LOG_TELEMETRY_CTRL = 0x08,
-	NVME_LOG_ENDURANCE_GROUP = 0x09,
+	NVME_LOG_FDP_CONFS      = 0x20, //update~ 
+	NVME_LOG_FDP_RUH_USAGE  = 0x21,
+	NVME_LOG_FDP_STATS      = 0x22,
+	NVME_LOG_FDP_EVENTS     = 0x23, //~update
 	NVME_LOG_ANA = 0x0c,
 	NVME_LOG_DISC = 0x70,
 	NVME_LOG_RESERVATION = 0x80,
+	NVME_TIMESTAMP                  = 0xe,	//update
+        NVME_FDP_MODE                   = 0x1d, //update
+    	NVME_FDP_EVENTS                 = 0x1e, //update
 	NVME_FWACT_REPL = (0 << 3),
 	NVME_FWACT_REPL_ACTV = (1 << 3),
 	NVME_FWACT_ACTV = (2 << 3),
@@ -615,6 +757,41 @@ struct nvme_format_cmd {
 	__u32 rsvd11[5];
 };
 
+struct NvmeSglDescriptor {
+	__u64 addr;
+	__u32 len;
+	__u8 rsvd[3];
+	__u8 type;
+};
+
+struct NvmeCmdDptr {
+	union 
+	{
+		struct 
+		{
+			__u64 prp1;
+			__u64 prp2;
+		};
+		struct NvmeSglDescriptor sgl;
+	};
+};
+
+struct nvme_fdp_cmd {
+	__u8 opcode;
+	__u8 flags;
+	__u16 command_id;
+	__le32 nsid;
+	__le64 res2;
+	__le64 mptr;
+	struct NvmeCmdDptr dptr;
+	__le32 cdw10;
+	__le32 cdw11;
+	__le32 cdw12;
+	__le32 cdw13;
+	__le32 cdw14;
+	__le32 cdw15;
+};
+
 struct nvme_command {
 	union {
 		struct nvme_common_command common;
@@ -629,6 +806,7 @@ struct nvme_command {
 		struct nvme_format_cmd format;
 		struct nvme_dsm_cmd dsm;
 		struct nvme_abort_cmd abort;
+		struct nvme_fdp_cmd fdp_cmd;
 	};
 };
 
@@ -638,6 +816,31 @@ enum {
 	NVME_SCT_MEDIA_INTEGRITY_ERRORS,
 	NVME_SCT_PATH_RELATED_STATUS
 };
+
+enum {                                 //update~
+        /* Host events */
+        FDP_EVT_RU_NOT_FULLY_WRITTEN = 0x0,
+        FDP_EVT_RU_ATL_EXCEEDED = 0x1,
+        FDP_EVT_CTRL_RESET_RUH = 0x2,
+        FDP_EVT_INVALID_PID = 0x3, 
+        /* CTRL events */
+        FDP_EVT_MEDIA_REALLOC = 0x80, 
+        FDP_EVT_RUH_IMPLICIT_RU_CHANGE = 0x81, 
+};
+
+#define FDP_EVT_MAX 0xff                                //update~
+#define NVME_FDP_MAX_NS_RUHS 32u
+#define FDPVSS 0                                                //~update
+
+static const uint8_t nvme_fdp_evf_shifts[FDP_EVT_MAX] = { //update~
+    /* Host events */    [FDP_EVT_RU_NOT_FULLY_WRITTEN]      = 0,
+    [FDP_EVT_RU_ATL_EXCEEDED]           = 1,
+    [FDP_EVT_CTRL_RESET_RUH]            = 2,
+    [FDP_EVT_INVALID_PID]               = 3,
+    /* CTRL events */
+    [FDP_EVT_MEDIA_REALLOC]             = 32,
+    [FDP_EVT_RUH_IMPLICIT_RU_CHANGE]    = 33,
+};                                                      //~update
 
 enum {
 	NVME_SC_SUCCESS = 0x0,
@@ -653,6 +856,8 @@ enum {
 	NVME_SC_FUSED_MISSING = 0xa,
 	NVME_SC_INVALID_NS = 0xb,
 	NVME_SC_CMD_SEQ_ERROR = 0xc,
+	NVME_FDP_DISABLED = 0x29, //update
+    	NVME_INVALID_PHID_LIST = 0x2a, //update
 	NVME_SC_SGL_INVALID_LAST = 0xd,
 	NVME_SC_SGL_INVALID_COUNT = 0xe,
 	NVME_SC_SGL_INVALID_DATA = 0xf,

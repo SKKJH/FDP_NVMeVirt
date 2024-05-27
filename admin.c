@@ -12,6 +12,10 @@
 #define prp_address_offset(prp, offset) \
 	(page_address(pfn_to_page(prp >> PAGE_SHIFT) + offset) + (prp & ~PAGE_MASK))
 #define prp_address(prp) prp_address_offset(prp, 0)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 
 static void __make_cq_entry_results(int eid, u16 ret, u32 result0, u32 result1)
 {
@@ -167,6 +171,17 @@ static void __nvmev_admin_delete_sq(int eid)
 /***
  * Log pages
  */
+#define ROUND_DOWN(n, d) ((n) & -(0 ? (n) : (d)))
+#define ROUND_UP(n, d) ROUND_DOWN((n) + (d) - 1, (d))
+#define MiB (1 << 20)
+
+static size_t sizeof_fdp_conf_descr(size_t nruh)
+{
+    size_t entry_siz = sizeof(struct NvmeFdpDescrHdr) + nruh * sizeof(struct NvmeRuhDescr);
+    return ROUND_UP(entry_siz, 8);
+}
+
+
 static void __nvmev_admin_get_log_page(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
@@ -178,6 +193,7 @@ static void __nvmev_admin_get_log_page(int eid)
 
 	switch (cmd->lid) {
 	case NVME_LOG_SMART: {
+		printk("SMART LOG!!!\r\n\n");
 		static const struct nvme_smart_log smart_log = {
 			.critical_warning = 0,
 			.spare_thresh = 20,
@@ -192,6 +208,7 @@ static void __nvmev_admin_get_log_page(int eid)
 		break;
 	}
 	case NVME_LOG_CMD_EFFECTS: {
+		printk("NVME_LOG_CMD_EFFECTS!!!\r\n\n");
 		static const struct nvme_effects_log effects_log = {
 			.acs = {
 				[nvme_admin_get_log_page] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
@@ -221,6 +238,115 @@ static void __nvmev_admin_get_log_page(int eid)
 		__memcpy(page, &effects_log, len);
 		break;
 	}
+
+	
+	case NVME_LOG_FDP_CONFS: {
+
+		printk("here in \n");
+		uint32_t log_size, trans_len;
+    		uint8_t *buf = NULL;
+		struct NvmeFdpDescrHdr *hdr;
+    		struct NvmeRuhDescr *ruhd;
+    		struct NvmeEnduranceGroup *endgrp;
+    		struct NvmeFdpConfsHdr *log;
+		size_t nruh, fdp_descr_size;
+    		int i;
+
+		__le32 lpol = cmd->lpol;
+		__le32 lpou = cmd->lpou;
+
+		// off 계산
+		uint64_t off = ((__u64)lpou << 32ULL) | lpol;
+
+		endgrp = &nvmev_vdev->ns->endgrps;
+		if (endgrp->fdp.enabled) {
+     			nruh = endgrp->fdp.nruh;
+    		} else {
+			nruh = 1;
+		}
+		fdp_descr_size = sizeof_fdp_conf_descr(nruh);
+    		log_size = sizeof(struct NvmeFdpConfsHdr) + fdp_descr_size;
+
+		if (off >= log_size) {
+			NVMEV_ERROR("off >= log_size: 0x%hhx,"
+                            "the system will be unstable!\n", cmd->lid);
+			 __memset(page, 0, len);
+			break;
+      	 		 //return NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+    		}
+
+		printk("len = %d\r\n",len);
+		trans_len = MIN(log_size - off, len);
+		printk("temp len = %lld\r\n",log_size - off);
+		printk("trans len = %d\r\n",len);
+		buf = kzalloc(log_size, GFP_KERNEL);
+		log = (struct NvmeFdpConfsHdr *)buf;
+		hdr = (struct NvmeFdpDescrHdr *)(log + 1);
+		ruhd = (struct NvmeRuhDescr *)(buf + sizeof(*log) + sizeof(*hdr));
+		
+		log->num_confs = cpu_to_le16(0);
+    		log->size = cpu_to_le32(log_size);
+		
+		hdr->descr_size = cpu_to_le16(fdp_descr_size);
+		if (endgrp->fdp.enabled) {
+       			//hdr->fdpa = FIELD_DP8(hdr->fdpa, FDPA, VALID, 1);
+        		//hdr->fdpa = FIELD_DP8(hdr->fdpa, FDPA, RGIF, endgrp->fdp.rgif);
+        		hdr->nrg = cpu_to_le16(endgrp->fdp.nrg);
+        		hdr->nruh = cpu_to_le16(endgrp->fdp.nruh);
+        		hdr->maxpids = cpu_to_le16(NVME_FDP_MAXPIDS - 1);
+        		hdr->nnss = cpu_to_le32(NVME_MAX_NAMESPACES);
+        		hdr->runs = cpu_to_le64(endgrp->fdp.runs);
+			printk("hdr->nrg ; %d\r\n",hdr->nrg);
+			printk("hdr->nruh ; %d\r\n",hdr->nruh);
+			printk("hdr->maxpids ; %d\r\n",hdr->maxpids);
+			printk("hdr->nnss ; %d\r\n",hdr->nnss);
+			printk("hdr->runs ; %lld\r\n",hdr->runs);
+
+        		for (i = 0; i < nruh; i++) {
+            			ruhd->ruht = NVME_RUHT_INITIALLY_ISOLATED;
+            			ruhd++;
+				printk("NVME_RUHT_INITIALLY_ISOLATED\r\n");
+        		}
+    		} else {
+		
+        		/* 1 bit for RUH in PIF -> 2 RUHs max. */
+        	
+			hdr->nrg = cpu_to_le16(1);
+        		hdr->nruh = cpu_to_le16(1);
+        		hdr->maxpids = cpu_to_le16(NVME_FDP_MAXPIDS - 1);
+        		hdr->nnss = cpu_to_le32(1);
+        		hdr->runs = cpu_to_le64(96 * MiB);
+
+        		ruhd->ruht = NVME_RUHT_INITIALLY_ISOLATED;
+    		}
+		__memcpy(page, buf, log->size);
+		//kfree(buf);
+		break;
+	}
+	
+	case NVME_LOG_FDP_STATS:
+	{
+		struct NvmeEnduranceGroup *endgrp;
+    		struct NvmeFdpStatsLog log = {};
+
+		__le32 lpol = cmd->lpol;
+                __le32 lpou = cmd->lpou;
+
+                // off 계산
+                uint64_t off = ((__u64)lpou << 32ULL) | lpol;
+		endgrp = &nvmev_vdev->ns->endgrps;
+
+    		unsigned int trans_len = MIN(sizeof(log) - off, len);
+
+    		/* spec value is 128 bit, we only use 64 bit */
+    		log.hbmw[0] = cpu_to_le64(endgrp->fdp.hbmw);
+    		log.mbmw[0] = cpu_to_le64(endgrp->fdp.mbmw);
+    		log.mbe[0] = cpu_to_le64(endgrp->fdp.mbe);	
+
+		__memcpy(page, &log, trans_len);
+		break;
+	}
+		
 	default:
 		/*
 		 * The NVMe protocol mandates several commands (lid) to be implemented, but some
@@ -493,6 +619,15 @@ static void __nvmev_admin_set_features(int eid)
 	case NVME_FEAT_HOST_ID:
 	case NVME_FEAT_RESV_MASK:
 	case NVME_FEAT_RESV_PERSIST:
+	case NVME_TIMESTAMP:
+		nvmev_vdev->time_stamp = cmd->dword11;
+		break;
+	case NVME_FDP_MODE:
+		nvmev_vdev->fdp_mode = cmd->dword11;
+		break;
+	case NVME_FDP_EVENTS:
+		nvmev_vdev->fdp_events = cmd->dword11;
+		break;
 	default:
 		break;
 	}
@@ -527,6 +662,16 @@ static void __nvmev_admin_get_features(int eid)
 	case NVME_FEAT_HOST_ID:
 	case NVME_FEAT_RESV_MASK:
 	case NVME_FEAT_RESV_PERSIST:
+	case NVME_TIMESTAMP:					// update ~
+		result0 = cpu_to_le32(nvmev_vdev->time_stamp);
+		break;
+	case NVME_FDP_MODE:
+		result0 = cpu_to_le32(nvmev_vdev->fdp_mode);
+		printk("NVME_FDP_MODE : %d\n",result0);
+		break;
+	case NVME_FDP_EVENTS:
+		result0 = cpu_to_le32(nvmev_vdev->fdp_events);	// ~ update
+		break;
 	default:
 		break;
 	}
@@ -550,7 +695,7 @@ static void __nvmev_proc_admin_req(int entry_id)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_command *sqe = &sq_entry(entry_id);
 
-	NVMEV_DEBUG("%s: %d 0x%x 0x%x\n", __func__, entry_id,
+	printk("%s: %d 0x%x 0x%x\n", __func__, entry_id,
 			sqe->common.opcode, sqe->common.command_id);
 
 	switch (sqe->common.opcode) {

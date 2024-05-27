@@ -7,6 +7,8 @@
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "channel_model.h"
+#include "queue.h"
+
 /*
     Default malloc size (when sector size is 512B)
     Channel = 40 * 8 = 320
@@ -208,6 +210,16 @@ struct ssdparams {
 	unsigned long tt_luns; /* total # of LUNs in the SSD */
 
 	unsigned long long write_buffer_size;
+
+	// update ~
+        int tt_valid_pgs;
+        int secs_per_ru;
+        int pgs_per_ru;
+        int blks_per_ru;
+        int chs_per_ru;
+        int luns_per_ru;
+        int tt_rus;                 
+	//~update
 };
 
 struct ssd {
@@ -216,6 +228,53 @@ struct ssd {
 	struct ssd_pcie *pcie;
 	struct buffer *write_buffer;
 	unsigned int cpu_nr_dispatcher;
+
+	// update ~
+        struct fdp_ru_mgmt *rums;       /* raclaim unit managements */
+        struct ruh *ruhtbl;                     /* ruh table */
+        struct NvmeEnduranceGroup *endgrp;
+        bool fdp_enabled;
+#ifdef UPDATE_FREQ
+        struct tenant ten[4];
+#endif
+        //~ update
+};
+
+struct ru {                     //update~
+        int id;
+        struct wp {
+                int ch;
+                int lun;
+                int pl;
+                int blk;
+                int pg;
+        } wp;
+        struct nand_block* blks[RG_DEGREE];
+        int ipc;
+        int vpc;
+        QTAILQ_ENTRY(ru) entry;         /* in either {free, victim, full} list */
+        size_t pos;                                     /* position in the priority queue for victim ru */
+        int ruhid;                                      /* needed for gc */
+        int rut;                                        /* ru type: normal, ii_gc, pi_gc */
+};
+
+struct ruh {
+        int ruht;                                       /* ruh type: ii_gc, pi_gc */
+        int* cur_ruids; 
+        int* pi_gc_ruids;
+};
+
+struct fdp_ru_mgmt {                                                    
+        struct ru *rus;
+        QTAILQ_HEAD(free_ru_list, ru) free_ru_list;
+        pqueue_t *victim_ru_pq;
+    	//QTAILQ_HEAD(victim_blk_list, blk) victim_blk_list;
+        QTAILQ_HEAD(full_ru_list, ru) full_ru_list;
+        int tt_rus;
+        int free_ru_cnt;
+        int victim_ru_cnt;
+        int full_ru_cnt;
+        int ii_gc_ruid;                 /* recalim unit for initially isolated gc */
 };
 
 static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)

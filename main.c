@@ -591,6 +591,12 @@ static int NVMeV_init(void)
 	__print_base_config();
 
 	nvmev_vdev = VDEV_INIT();
+	
+	// update ~
+	nvmev_vdev->fdp_events = 0;
+        nvmev_vdev->fdp_mode = 0;
+	// ~ update
+
 	if (!nvmev_vdev)
 		return -EINVAL;
 
@@ -600,7 +606,7 @@ static int NVMeV_init(void)
 
 	NVMEV_STORAGE_INIT(nvmev_vdev);
 
-	NVMEV_NAMESPACE_INIT(nvmev_vdev);
+//	NVMEV_NAMESPACE_INIT(nvmev_vdev);
 
 	if (io_using_dma) {
 		if (ioat_dma_chan_set("dma7chan0") != 0) {
@@ -617,6 +623,8 @@ static int NVMeV_init(void)
 
 	NVMEV_IO_WORKER_INIT(nvmev_vdev);
 	NVMEV_DISPATCHER_INIT(nvmev_vdev);
+
+	NVMEV_NAMESPACE_INIT(nvmev_vdev);
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 

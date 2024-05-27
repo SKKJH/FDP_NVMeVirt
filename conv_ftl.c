@@ -12,9 +12,19 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 	return (ppa->g.pg % spp->pgs_per_oneshotpg) == (spp->pgs_per_oneshotpg - 1);
 }
 
+static inline bool should_fdp_gc(struct conv_ftl *conv_ftl, uint16_t rg)  //update~
+{
+        return (conv_ftl->ssd->rums[rg].free_ru_cnt <= conv_ftl->cp.gc_thres_rus);
+}
+
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
 	return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
+}
+
+static inline bool should_fdp_gc_high(struct conv_ftl *conv_ftl, uint16_t rg)
+{
+	return (conv_ftl->ssd->rums[rg].free_ru_cnt <= conv_ftl->cp.gc_thres_rus_high);
 }
 
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
@@ -161,7 +171,29 @@ static void init_write_flow_control(struct conv_ftl *conv_ftl)
 
 static inline void check_addr(int a, int max)
 {
+	printk("a : %d\r\n",a);
 	NVMEV_ASSERT(a >= 0 && a < max);
+}
+
+static int get_next_free_ruid(struct conv_ftl *conv_ftl, struct fdp_ru_mgmt *rum) //update~
+{
+#ifdef FDP_DEBUG
+        printk("get_next_free_ruid() called -> ");
+#endif
+        struct ru *retru = NULL;
+
+        retru = QTAILQ_FIRST(&rum->free_ru_list);
+        if (!retru) {
+                //ftl_err("No free reclaim units left in [%s] !!!!\n", ssd->ssdname);
+                return -1;
+        }
+#ifdef FDP_DEBUG
+        printk("new ru: %d\n", retru->id);
+#endif
+        QTAILQ_REMOVE(&rum->free_ru_list, retru, entry);
+        rum->free_ru_cnt--;
+
+        return retru->id;
 }
 
 static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
@@ -209,6 +241,147 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 		.blk = curline->id,
 		.pl = 0,
 	};
+}
+
+static void advance_fdp_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type, uint16_t rgid, uint16_t ruhid)
+{
+        struct ssdparams *spp = &conv_ftl->ssd->sp;
+        struct fdp_ru_mgmt *rum = &conv_ftl->ssd->rums[rgid];
+        struct ruh *ruh = &conv_ftl->ssd->ruhtbl[ruhid];
+        int max_ch = (rgid + 1) * (RG_DEGREE / spp->luns_per_ch);
+        int ruid;
+        struct ru *ru = NULL;
+	printk("get advance_fdp_write_pointer metadata \r\n");
+
+	if (io_type == GC_IO) {
+                if (ruh->ruht == NVME_RUHT_INITIALLY_ISOLATED) {
+                        ruid = rum->ii_gc_ruid;
+		}
+                else { 
+                        ruid = ruh->pi_gc_ruids[rgid];
+		}
+        }
+        else {
+                ruid = ruh->cur_ruids[rgid];
+	}
+	ru = &rum->rus[ruid];
+
+#ifdef SMALL_RG
+        if (RG_DEGREE > spp->luns_per_ch)
+        {
+#endif
+                check_addr(ru->wp.ch, max_ch);
+                ru->wp.ch++;
+                if (ru->wp.ch == max_ch) {
+                        ru->wp.ch = rgid * (RG_DEGREE / spp->luns_per_ch);
+                        check_addr(ru->wp.lun, spp->luns_per_ch);
+                        ru->wp.lun++;
+                        // in this case, we should go to next lun 
+                        if (ru->wp.lun == spp->luns_per_ch) {
+                                ru->wp.lun = 0;
+                                // go to next page in the block 
+                                check_addr(ru->wp.pg, spp->pgs_per_blk);
+                                ru->wp.pg++;
+                                if (ru->wp.pg == spp->pgs_per_blk) {
+                                        ru->wp.pg = 0;
+                                        // move current ru to {victim,full} ru list 
+                                        if (ru->vpc == spp->pgs_per_ru) {
+                                                // all pgs are still valid, move to full ru list 
+                                                NVMEV_ASSERT(ru->ipc == 0);
+                                                QTAILQ_INSERT_TAIL(&rum->full_ru_list, ru, entry);
+                                                rum->full_ru_cnt++;
+                                        } else {
+                                                NVMEV_ASSERT(ru->vpc >= 0 && ru->vpc < spp->pgs_per_ru);
+						NVMEV_ASSERT(ru->ipc > 0);
+                                                pqueue_insert(rum->victim_ru_pq, ru);
+                                                rum->victim_ru_cnt++;
+                                        }
+                                        // current ru is used up, pick another empty ru 
+                                        check_addr(ru->wp.blk, spp->blks_per_pl);
+                                        // ruh history for gc later 
+                                         ru->ruhid = ruhid;
+                                        if (ru->rut == RU_TYPE_II_GC) {
+                                                rum->ii_gc_ruid = get_next_free_ruid(conv_ftl, rum);
+                                                rum->rus[rum->ii_gc_ruid].rut = RU_TYPE_II_GC;
+                                        }
+                                        else if (ru->rut == RU_TYPE_PI_GC) {
+                                                ruh->pi_gc_ruids[rgid] = get_next_free_ruid(conv_ftl, rum);
+                                                rum->rus[ruh->pi_gc_ruids[rgid]].rut = RU_TYPE_PI_GC;
+                                                }
+					else {
+                                                // update ruhtbl 
+                                                ruh->cur_ruids[rgid] = get_next_free_ruid(conv_ftl, rum);
+                                                rum->rus[ruh->cur_ruids[rgid]].rut = RU_TYPE_NORMAL;
+                                        }
+                                        check_addr(ru->wp.blk, spp->blks_per_pl);
+                                        // make sure we are starting from page 0 in the ru 
+                                        NVMEV_ASSERT(ru->wp.pg == 0);
+                                        NVMEV_ASSERT(ru->wp.lun == 0);
+                                        NVMEV_ASSERT(ru->wp.ch == rgid * (RG_DEGREE / spp->luns_per_ch));
+                                        // TODO: assume # of pl_per_lun is 1, fix later 
+                                        NVMEV_ASSERT(ru->wp.pl == 0);
+                                }
+                        }
+                }
+#ifdef SMALL_RG
+        }
+#endif
+#ifdef SMALL_RG
+        else
+        {
+                check_addr(ru->wp.lun, spp->luns_per_ch);
+                ru->wp.lun++;
+                 //move to next page 
+                if (ru->wp.lun % RG_DEGREE == 0)
+                {
+                        ru->wp.lun = 0;
+                        check_addr(ru->wp.pg, spp->pgs_per_ch);
+                        ru->wp.pg++;
+                        if (ru->wp.pg == spp->pgs_per_blk)
+                        {
+                                ru->wp.pg = 0;
+                   //              move current ru to {victim,full} ru list 
+                                if (ru->vpc == spp->pgs_per_blk * RG_DEGREE)
+                                {
+                                        // all pgs are still valid, move to full ru list 
+                                        NVMEV_ASSERT(ru->ipc == 0);
+                                        QTAILQ_INSERT_TAIL(&rum->full_ru_list, ru, entry);
+                                        rum->full_ru_cnt++;
+                                }
+				else
+                                {
+                                        // there must be some invalid pages in this ru 
+                                        //NVMEV_ASSERT(ru->vpn >= 0 && ru->vpc < RG_DEGREE * spp->pgs_per_blk);
+                                        NVMEV_ASSERT(ru->ipc > 0);
+                                        pqueue_insert(rum->victim_ru_pq, ru);
+                                        rum->victim_ru_cnt++;
+                                }
+                                // current ru is used up, pick another empty ru 
+                                ru->ruhid = ruhid;
+                                if (ru->rut == RU_TYPE_II_GC) {
+                                        rum->ii_gc_ruid = get_next_free_ruid(conv_ftl, rum);
+                                        rum->rus[rum->ii_gc_ruid].rut = RU_TYPE_II_GC;
+                                }
+                                else if (ru->rut == RU_TYPE_PI_GC) {
+                                        ruh->pi_gc_ruids[rgid] = get_next_free_ruid(conv_ftl, rum);
+                                        rum->rus[ruh->pi_gc_ruids[rgid]].rut = RU_TYPE_PI_GC;
+                                }
+                                else {
+                                        // update ruhtbl 
+                                        ruh->cur_ruids[rgid] = get_next_free_ruid(conv_ftl, rum);
+                                        rum->rus[ruh->cur_ruids[rgid]].rut = RU_TYPE_NORMAL;
+                                }
+                                check_addr(ru->wp.blk, spp->blks_per_pl);
+                                // make sure we are starting from page 0 in the ru 
+                                NVMEV_ASSERT(ru->wp.pg == 0);
+                                NVMEV_ASSERT(ru->wp.lun == 0);
+                                // TODO: assume # of pl_per_lun is 1, fix later 
+                                NVMEV_ASSERT(ru->wp.pl == 0);
+                        }
+                }
+        }
+#endif
+
 }
 
 static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
@@ -279,6 +452,38 @@ out:
 			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
+static struct ppa fdp_get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type, uint16_t rgid, uint16_t ruhid)
+{
+        struct fdp_ru_mgmt *rum = &conv_ftl->ssd->rums[rgid];
+        struct ruh* ruh = &conv_ftl->ssd->ruhtbl[ruhid];
+        int ruid;
+        struct ru *ru;
+        struct ppa ppa;
+
+        if (io_type == GC_IO) {
+                if (ruh->ruht == NVME_RUHT_INITIALLY_ISOLATED)
+                        ruid = rum->ii_gc_ruid;
+                else
+                        ruid = ruh->pi_gc_ruids[rgid];
+        }
+        else // normal
+                ruid = ruh->cur_ruids[rgid];
+
+        ppa.ppa = 0;
+
+        rum = &conv_ftl->ssd->rums[rgid];
+        ru = &rum->rus[ruid];
+	printk("\n20\n");
+	//printk("ch : %d, lun : %d, pg : %d, blk : %d, pl : %d\r\n", ru->wp.ch, ru->wp.lun, ru->wp.pg, ru->wp.blk, ru->wp.pl);
+        ppa.g.ch = ru->wp.ch;
+        ppa.g.lun = ru->wp.lun;
+        ppa.g.pg = ru->wp.pg;
+        ppa.g.blk = ru->wp.blk;
+        ppa.g.pl = ru->wp.pl;
+	printk("\n21\n");
+        return ppa;
+}
+
 static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
 	struct ppa ppa;
@@ -323,17 +528,150 @@ static void init_rmap(struct conv_ftl *conv_ftl)
 	}
 }
 
+static inline int victim_ru_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)//update~
+{
+    return (next > curr);
+}
+
+static inline pqueue_pri_t victim_ru_get_pri(void *a)
+{
+    return ((struct ru *)a)->vpc;
+}
+
+static inline void victim_ru_set_pri(void *a, pqueue_pri_t pri)
+{
+    ((struct ru *)a)->vpc = pri;
+}
+
+static inline size_t victim_ru_get_pos(void *a)
+{
+    return ((struct ru *)a)->pos;
+}
+
+static inline void victim_ru_set_pos(void *a, size_t pos)
+{
+    ((struct ru *)a)->pos = pos;
+}                                                                       //~update
+
+static void init_fdp_ru_mgmts(struct conv_ftl *conv_ftl)
+{
+       	struct ssdparams *spp = &conv_ftl->ssd->sp;
+        struct fdp_ru_mgmt *rum = NULL;
+        struct ru *ru = NULL;
+        int nrg = spp->tt_luns / RG_DEGREE;
+        int blkoff;
+
+	conv_ftl->ssd->rums = kzalloc(sizeof(struct fdp_ru_mgmt) * nrg, GFP_KERNEL);	
+	
+	for (int i = 0; i < nrg; i++) {
+                rum = &conv_ftl->ssd->rums[i];
+                rum->tt_rus = spp->blks_per_lun;
+                //assert(rum->tt_rus == spp->blks_per_lun);
+                //rum->rus = g_malloc0(sizeof(struct ru) * rum->tt_rus);
+                rum->rus = kzalloc(sizeof(struct ru) * rum->tt_rus, GFP_KERNEL);
+                QTAILQ_INIT(&rum->free_ru_list);
+                rum->victim_ru_pq = pqueue_init(spp->tt_blks, victim_ru_cmp_pri, victim_ru_get_pri, victim_ru_set_pri, victim_ru_get_pos, victim_ru_set_pos);
+                QTAILQ_INIT(&rum->full_ru_list);
+		
+		rum->free_ru_cnt = 0;
+
+		for (int j = 0; j < rum->tt_rus; j++) {
+                        ru = &rum->rus[j];
+                        ru->id = j;
+                        ru->wp.ch = i * RG_DEGREE / spp->luns_per_ch;
+                        ru->wp.lun = i * RG_DEGREE % spp->luns_per_ch;
+                        ru->wp.pl = 0;
+                        ru->wp.blk = j;
+                        ru->wp.pg = 0;
+                        ru->ipc = 0;
+                        ru->vpc = 0;
+                        ru->pos = 0;
+                        ru->rut = RU_TYPE_NORMAL;
+                        /* ruh history for gc */
+                        if (j < MAX_RUHS)
+                                ru->ruhid = j;
+
+                        blkoff = j % spp->blks_per_pl;
+                        //ru->blks = gmalloc0(sizeof(struct nand_block*) * RG_DEGREE);
+                        for (int k = 0; k < RG_DEGREE; k++) {
+                                int cur_ch = ru->wp.ch + k / spp->luns_per_ch;
+                                int cur_lun = (ru->wp.lun + k) % spp->luns_per_ch;
+
+                                ru->blks[k] = &conv_ftl->ssd->ch[cur_ch].lun[cur_lun].pl[0].blk[blkoff];
+                        }
+
+                        /* initialize all the reclaim units as free reclaim units */
+                        QTAILQ_INSERT_TAIL(&rum->free_ru_list, ru, entry);
+                        rum->free_ru_cnt++;
+                }
+                //ftl_assert(rum->free_ru_cnt == rum->tt_rus);
+                rum->victim_ru_cnt = 0;
+                rum->full_ru_cnt = 0;
+	}
+}
+
+static void init_fdp_ruhtbl(struct conv_ftl *conv_ftl, struct nvmev_ns *ns)
+{
+	struct ruh *ruh = NULL;
+        struct fdp_ru_mgmt *rum = NULL;
+
+	conv_ftl->ssd->fdp_enabled = ns->endgrps.fdp.enabled;
+        conv_ftl->ssd->ruhtbl = kzalloc(sizeof(struct ruh) * ns->endgrps.fdp.nruh, GFP_KERNEL);
+        for (int i = 0; i < ns->endgrps.fdp.nruh; i++) {
+                ruh = &conv_ftl->ssd->ruhtbl[i];
+                ruh->ruht = ns->endgrps.fdp.ruhs[i].ruht;
+                ruh->cur_ruids = kzalloc(sizeof(int) * ns->endgrps.fdp.nrg, GFP_KERNEL);
+                ruh->pi_gc_ruids = kzalloc(sizeof(int) * ns->endgrps.fdp.nrg, GFP_KERNEL);
+                for (int j = 0; j < ns->endgrps.fdp.nrg; j++)  {
+                        rum = &conv_ftl->ssd->rums[j];
+                        ruh->cur_ruids[j] = get_next_free_ruid(conv_ftl, rum);
+                }
+        }
+	/* reserve one ru for initially isolated gc */
+        for (int i = 0; i < ns->endgrps.fdp.nrg; i++) {
+                rum = &conv_ftl->ssd->rums[i];
+                rum->ii_gc_ruid = get_next_free_ruid(conv_ftl, rum);
+                rum->rus[rum->ii_gc_ruid].rut = RU_TYPE_II_GC;
+        }
+
+	        /* reserve rus for persistently isolated gc */
+        /*
+        for (int i = 0; i < endgrp->fdp.nrg; i++) {
+                int pi_gc_ruid;
+                rum = &ssd->rums[i];
+
+                pi_gc_ruid = get_next_free_ruid(ssd, rum);
+                ssd->ruhtbl[0].pi_gc_ruids[i] = pi_gc_ruid;
+                rum->rus[pi_gc_ruid].rut = RU_TYPE_PI_GC;
+
+                pi_gc_ruid = get_next_free_ruid(ssd, rum);
+                ssd->ruhtbl[1].pi_gc_ruids[i] = pi_gc_ruid;
+                rum->rus[pi_gc_ruid].rut = RU_TYPE_PI_GC;
+
+                pi_gc_ruid = get_next_free_ruid(ssd, rum);
+                ssd->ruhtbl[2].pi_gc_ruids[i] = pi_gc_ruid;
+                rum->rus[pi_gc_ruid].rut = RU_TYPE_PI_GC;
+
+                pi_gc_ruid = get_next_free_ruid(ssd, rum);
+                ssd->ruhtbl[3].pi_gc_ruids[i] = pi_gc_ruid;
+                rum->rus[pi_gc_ruid].rut = RU_TYPE_PI_GC;
+        }*/
+
+}
+
 static void remove_rmap(struct conv_ftl *conv_ftl)
 {
 	vfree(conv_ftl->rmap);
 }
 
-static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, struct ssd *ssd)
+static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, struct ssd *ssd, struct nvmev_ns *ns)
 {
 	/*copy convparams*/
 	conv_ftl->cp = *cpp;
 
 	conv_ftl->ssd = ssd;
+
+	conv_ftl->ssd->endgrp = &ns->endgrps;
 
 	/* initialize maptbl */
 	init_maptbl(conv_ftl); // mapping table
@@ -349,6 +687,10 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	prepare_write_pointer(conv_ftl, GC_IO);
 
 	init_write_flow_control(conv_ftl);
+
+	/* intialize fdp */
+	init_fdp_ru_mgmts(conv_ftl);
+	init_fdp_ruhtbl(conv_ftl, ns);
 
 	NVMEV_INFO("Init FTL instance with %d channels (%ld pages)\n", conv_ftl->ssd->sp.nchs,
 		   conv_ftl->ssd->sp.tt_pgs);
@@ -370,10 +712,77 @@ static void conv_init_params(struct convparams *cpp)
 	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
 	cpp->enable_gc_delay = 1;
 	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
+
+	cpp->gc_thres_rus = 20;
+	cpp->gc_thres_rus_high = 20;
 }
 
-void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
-			 uint32_t cpu_nr_dispatcher)
+static int cal_rgif(int nrg)            // update ~
+{
+        int n = nrg;
+        int cnt = 0;
+
+        while (n > 1)
+        {
+                n = n / 2;
+                cnt++;
+        }
+
+        return cnt;
+}                                       // ~ update
+
+static void conv_init_endgrps(struct nvmev_ns *ns, struct ssdparams *spp)
+{
+	struct NvmeRuHandle *ruh = NULL;
+        const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(0);
+        const uint8_t data_shift = 9;
+	ns->num_endgrps = 1;
+
+	for (int i = 0; i < ns->num_endgrps; i++)
+        {
+		//now num_endgrps is 1 as a default,
+		//that's why ns->endgrps is not a pointer
+		ns->endgrps.fdp.runs = RG_DEGREE * spp->pgs_per_blk * spp->secs_per_pg * spp->secsz;
+		ns->endgrps.fdp.nrg = spp->nchs * spp->luns_per_ch / RG_DEGREE;
+	//	printk("ns->endgrps.fdp.nrg %d\n",ns->endgrps.fdp.nrg);
+		ns->endgrps.fdp.rgif = cal_rgif(ns->endgrps.fdp.nrg);
+		ns->endgrps.fdp.nruh = MAX_RUHS;
+
+		ns->endgrps.fdp.hbmw = 0;
+		ns->endgrps.fdp.mbmw = 0;
+		ns->endgrps.fdp.mbe = 0;
+
+		ns->endgrps.fdp.ruhs = kzalloc(sizeof(struct NvmeRuHandle) * ns->endgrps.fdp.nruh, GFP_KERNEL);
+
+		for (int ruhid = 0; ruhid < ns->endgrps.fdp.nruh; ruhid++)
+		{
+	//		printk("ruhid %d\n",ruhid);
+			ns->endgrps.fdp.ruhs[ruhid] = (struct NvmeRuHandle)
+			{
+				.ruht = NVME_RUHT_INITIALLY_ISOLATED,
+                        	.ruha = NVME_RUHA_HOST,
+                        	.ruamw = ns->endgrps.fdp.runs >> data_shift,
+                        	.lbafi = lba_index,
+                        	.rus = kzalloc(sizeof(struct NvmeReclaimUnit) * ns->endgrps.fdp.nrg, GFP_KERNEL)
+			};
+			for (int rgid = 0; rgid < ns->endgrps.fdp.nrg; rgid++)
+			{
+                       		ns->endgrps.fdp.ruhs[ruhid].rus[rgid].ruamw = ns->endgrps.fdp.ruhs[ruhid].ruamw;
+	//			printk("ns->endgrps.fdp.ruhs[%d].rus[%d].ruamw : %lld\n",ruhid , rgid, ns->endgrps.fdp.ruhs[ruhid].ruamw);
+			}
+			ns->endgrps.fdp.enabled = true;
+		}
+	}
+	ns->fdp_ns.nphs = ns->endgrps.fdp.nruh;
+        ns->fdp_ns.phs = kzalloc(sizeof(uint16_t) * ns->fdp_ns.nphs, GFP_KERNEL);
+
+	for (int i = 0; i < ns->fdp_ns.nphs; i++) {
+                ns->fdp_ns.phs[i] = i;
+		printk("phs : %d\n",ns->fdp_ns.phs[i]);
+	}
+}
+
+void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr, uint32_t cpu_nr_dispatcher)
 {
 	struct ssdparams spp;
 	struct convparams cpp;
@@ -383,6 +792,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	const uint32_t nr_parts = SSD_PARTITIONS;
 
 	ssd_init_params(&spp, size, nr_parts);
+	conv_init_endgrps(ns, &spp);             //update
 	conv_init_params(&cpp);
 
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
@@ -390,7 +800,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 		ssd_init(ssd, &spp, cpu_nr_dispatcher);
-		conv_init_ftl(&conv_ftls[i], &cpp, ssd);
+		conv_init_ftl(&conv_ftls[i], &cpp, ssd, ns);
 	}
 
 	/* PCIe, Write buffer are shared by all instances*/
@@ -593,6 +1003,44 @@ static void gc_read_page(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	}
 }
 
+static uint64_t fdp_gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa, uint16_t rgid, uint16_t ruhid)
+{
+        struct ssdparams *spp = &conv_ftl->ssd->sp;
+        struct convparams *cpp = &conv_ftl->cp;
+        struct ppa new_ppa;
+        uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
+
+        NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
+        new_ppa = fdp_get_new_page(conv_ftl, GC_IO, rgid, ruhid);       //update
+        /* update maptbl */
+        set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+        /* update rmap */
+        set_rmap_ent(conv_ftl, lpn, &new_ppa);
+
+        mark_page_valid(conv_ftl, &new_ppa);
+
+        /* need to advance the write pointer here */
+        advance_fdp_write_pointer(conv_ftl, GC_IO, rgid, ruhid);        //update
+
+        if (cpp->enable_gc_delay) {
+                struct nand_cmd gcw = {
+                        .type = GC_IO,
+                        .cmd = NAND_NOP,
+                        .stime = 0,
+                        .interleave_pci_dma = false,
+                        .ppa = &new_ppa,
+                };
+                if (last_pg_in_wordline(conv_ftl, &new_ppa)) {
+                        gcw.cmd = NAND_WRITE;
+                        gcw.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg;
+                }
+
+                ssd_advance_nand(conv_ftl->ssd, &gcw);
+        }
+
+        return 0;
+}
+
 /* move valid page data (already in DRAM) from victim line to a new page */
 static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 {
@@ -689,6 +1137,31 @@ static void clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa)
 }
 
 /* here ppa identifies the block we want to clean */
+static int fdp_clean_one_block(struct conv_ftl *conv_ftl, struct ppa *ppa, uint16_t rgid, uint16_t ruhid)
+{
+        struct ssdparams *spp = &conv_ftl->ssd->sp;
+        struct nand_page *pg_iter = NULL;
+        int cnt = 0;
+        int pg;
+
+        for (pg = 0; pg < spp->pgs_per_blk; pg++) {
+                ppa->g.pg = pg;
+                pg_iter = get_pg(conv_ftl->ssd, ppa);
+                /* there shouldn't be any free page in victim blocks */
+                NVMEV_ASSERT(pg_iter->status != PG_FREE);
+                if (pg_iter->status == PG_VALID) {
+                        gc_read_page(conv_ftl, ppa);
+                        /* delay the maptbl update until "write" happens */
+                        fdp_gc_write_page(conv_ftl, ppa, rgid, ruhid);
+                        cnt++;
+                }
+        }
+
+        NVMEV_ASSERT(get_blk(conv_ftl->ssd, ppa)->vpc == cnt);
+        return cnt;
+}
+
+/* here ppa identifies the block we want to clean */
 static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -747,6 +1220,108 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	/* move this line to free line list */
 	list_add_tail(&line->entry, &lm->free_line_list);
 	lm->free_line_cnt++;
+}
+
+static struct ru *select_victim_ru(struct conv_ftl *conv_ftl, bool force, int rgid)
+{
+    struct fdp_ru_mgmt *rum = &conv_ftl->ssd->rums[rgid];
+    struct ru *victim_ru = NULL;
+
+    victim_ru = pqueue_peek(rum->victim_ru_pq);
+    if (!victim_ru) {
+        return NULL;
+    }
+
+    if (!force && victim_ru->ipc < conv_ftl->ssd->sp.pgs_per_ru / 8) {
+        return NULL;
+    }
+
+    pqueue_pop(rum->victim_ru_pq);
+    victim_ru->pos = 0;
+    rum->victim_ru_cnt--;
+
+    /* victim_ru is a danggling node now */
+    return victim_ru;
+}
+
+bool gc = 0;
+static int do_fdp_gc(struct conv_ftl *conv_ftl, uint16_t rgid, bool force, struct nvmev_request *req)
+{
+	if (!gc)
+                printk("do_fdp_gc() called\n");
+
+	struct ru *victim_ru = NULL;
+        struct ssdparams *spp = &conv_ftl->ssd->sp;
+        struct nand_lun *lunp;
+        struct ppa ppa;
+        struct fdp_ru_mgmt *rum = &conv_ftl->ssd->rums[rgid];
+        int start_lunidx = rgid * RG_DEGREE;
+        int ruhid;
+        int flashpg;
+
+	int gc_pgs = 0;
+
+	victim_ru = select_victim_ru(conv_ftl, force, rgid);
+        if (!victim_ru) {
+                return -1;
+        }
+        ppa.g.blk = victim_ru->id;
+        ruhid = victim_ru->ruhid;
+
+        NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk, victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt, ssd->lm.free_line_cnt);	
+#ifdef FDP_DEBUG
+        printk("rgid: %d\n", rgid);
+        printk("ruhid: %d\n", ruhid);
+        printk("victim_ru id: %d\n", victim_ru->id);
+        printk("victim_ru->ipc: %d\n", victim_ru->ipc);
+        printk("victim_ru->vpc: %d\n", victim_ru->vpc);
+#endif
+	for (int lunidx = start_lunidx; lunidx < start_lunidx + RG_DEGREE; lunidx++) {
+                ppa.g.ch = lunidx / spp->luns_per_ch;
+                ppa.g.lun = lunidx % spp->luns_per_ch;
+                ppa.g.pl = 0;
+                lunp = get_lun(conv_ftl->ssd, &ppa);
+                gc_pgs += fdp_clean_one_block(conv_ftl, &ppa, rgid, ruhid);  //update
+
+                if (flashpg == (spp->flashpgs_per_blk - 1)) {
+                        struct convparams *cpp = &conv_ftl->cp;
+                        mark_block_free(conv_ftl, &ppa);
+                        for (int lunidx = start_lunidx; lunidx < start_lunidx + RG_DEGREE; lunidx++) {
+                                if (cpp->enable_gc_delay) {
+                                        struct nand_cmd gce = {
+                                                .type = GC_IO,
+                                                .cmd = NAND_ERASE,
+                                                .stime = 0,
+                                                .interleave_pci_dma = false,
+                                                .ppa = &ppa,
+                                        };
+                                        ssd_advance_nand(conv_ftl->ssd, &gce);
+                                 }
+                                lunp->gc_endtime = lunp->next_lun_avail_time;
+                        }
+                }
+        }
+#ifdef WAF_TEST
+        req->ns->ctrl->gc_writes += gc_pgs * 8;
+#endif
+#ifdef DEVICE_UTIL_DEBUG
+        spp->tt_valid_pgs += gc_pgs;
+#endif
+/* reset wp of victim ru */
+        victim_ru->wp.ch = start_lunidx / spp->luns_per_ch;
+        victim_ru->wp.lun = start_lunidx % spp->luns_per_ch;
+        victim_ru->wp.pl = 0;
+        victim_ru->wp.blk = victim_ru->id;
+        victim_ru->wp.pg = 0;
+
+    /* update ru status */
+        victim_ru->ipc = 0;
+        victim_ru->vpc = 0;
+        QTAILQ_INSERT_TAIL(&rum->free_ru_list, victim_ru, entry);
+        rum->free_ru_cnt++;
+
+        return 0;
+
 }
 
 static int do_gc(struct conv_ftl *conv_ftl, bool force)
@@ -921,6 +1496,169 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	return true;
 }
 
+static inline uint16_t nvme_make_pid(struct nvmev_ns *ns, uint16_t rg, uint16_t ph)//update~
+{
+        uint16_t rgif = ns->endgrps.fdp.rgif;
+
+        if (rgif == 0)
+                return ph;
+
+        return (rg << (16 - rgif) | ph);
+}       //~update
+
+static inline bool nvme_ph_valid(struct nvmev_ns *ns, uint16_t ph)     //update~
+{
+        return ph < ns->fdp_ns.nphs;
+}       //~update
+
+static inline bool nvme_rg_valid(struct nvmev_ns *ns, uint16_t rg) //update~
+{
+        return rg < ns->endgrps.fdp.nrg;
+}
+
+static inline uint16_t nvme_pid2ph(struct nvmev_ns *ns, uint16_t pid)   //update~
+{
+        uint16_t rgif = ns->endgrps.fdp.rgif;
+
+        if (rgif == 0)
+                return pid;
+
+        return pid & ((1 << (15 - rgif))- 1);
+}       //~update
+
+static inline uint16_t nvme_pid2rg(struct nvmev_ns *ns, uint16_t pid)   //update~
+{
+        uint16_t rgif = ns->endgrps.fdp.rgif;
+
+        if (rgif == 0)
+                return 0;
+
+        return pid >> (16 - rgif);
+}       //~update 
+
+static inline bool nvme_parse_pid(struct nvmev_ns *ns, uint16_t pid, uint16_t *ph, uint16_t *rg)        //update~
+{
+        *ph = pid & 0x3FF;//nvme_pid2ph(ns, pid);
+        *rg = (pid >> 10) & 0x3F;//nvme_pid2rg(ns, pid);
+
+        return nvme_ph_valid(ns, *ph) && nvme_rg_valid(ns, *rg);
+}       //~update
+
+#  define __MAXUINT__(T) ((T) -1)
+#  define UINT64_MAX __MAXUINT__(uint64_t)
+
+static inline void nvme_fdp_stat_inc(uint64_t *a, uint64_t b)                                   //update~
+{
+    uint64_t ret = *a + b;
+    *a = ret < *a ? UINT64_MAX : ret;
+}
+
+static inline int log_event(struct NvmeRuHandle *ruh, uint8_t event_type)                              //update~
+{
+    return (ruh->event_filter >> nvme_fdp_evf_shifts[event_type]) & 0x1;
+}    //~update
+
+static struct NvmeFdpEvent *nvme_fdp_alloc_event(struct nvmev_ns *ns, struct NvmeFdpEventBuffer *ebuf)//update~
+{
+        struct NvmeFdpEvent *ret = NULL;
+        bool is_full = ebuf->next == ebuf->start && ebuf->nelems;
+
+        ret = &ebuf->events[ebuf->next++]; // allocation
+        if (ebuf->next == NVME_FDP_MAX_EVENTS)
+                ebuf->next = 0;
+        if (is_full)
+                ebuf->start = ebuf->next;
+        else
+                ebuf->nelems++;
+
+        memset(ret, 0, sizeof(struct NvmeFdpEvent)); // fill the 'ret' with 0
+        ret->timestamp = nvmev_vdev->time_stamp; //update
+
+        return ret;
+}
+
+static bool nvme_update_ruh(struct nvmev_ns *ns, uint16_t pid)
+{
+	struct NvmeRuHandle *ruh;
+        const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(0);
+        const uint8_t data_shift = 9;
+        struct NvmeReclaimUnit *ru;
+        struct NvmeFdpEvent *e = NULL;
+        uint64_t data_size;
+        uint16_t ph, rg, ruhid;
+
+	if (!nvme_parse_pid(ns, pid, &ph, &rg))
+                return false;
+
+	/* A stage that changes PHNDL to RUH */
+        ruhid = ns->fdp_ns.phs[ph];
+        ruh = &ns->endgrps.fdp.ruhs[ruhid];
+        ru = &ruh->rus[rg];
+
+        data_size = (uint64_t)ru->ruamw << data_shift;
+
+        if (ru->ruamw)
+        {
+        // Logging only when the device updates an RUH implicitly,
+        // Not logging when the host updates an RUH explicitly by i/o mgmt cmd.
+                if (log_event(ruh, FDP_EVT_RU_NOT_FULLY_WRITTEN))
+                {
+                        e = nvme_fdp_alloc_event(ns, &ns->endgrps.fdp.host_events);
+                        e->type = FDP_EVT_RU_NOT_FULLY_WRITTEN;
+                        e->flags = FDPEF_PIV | FDPEF_NSIDV | FDPEF_LV;
+                        e->pid = cpu_to_le16(pid);
+                        e->nsid = cpu_to_le32(ns->id);
+                        e->rgid = cpu_to_le16(rg);
+                        e->ruhid = cpu_to_le16(ruhid);
+                }
+
+                nvme_fdp_stat_inc(&ns->endgrps.fdp.mbmw, data_size);
+        }
+
+        ru->ruamw = ruh->ruamw; // Reset
+	return true;
+}
+
+static void nvme_do_write_fdp(struct nvmev_ns *ns, struct nvmev_request *req, uint64_t nlb) {
+    struct nvme_command *cmd = req->cmd;
+    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(0);
+    const uint8_t data_shift = 9;
+    uint64_t data_size = (uint64_t)nlb << data_shift;
+
+    uint32_t dw12 = le32_to_cpu(cmd->fdp_cmd.cdw12);
+    uint8_t dtype = (dw12 >> 20) & 0xf;
+    uint16_t pid = le16_to_cpu(cmd->rw.dspec);
+    uint16_t ph, rg, ruhid;
+    struct NvmeReclaimUnit *ru;
+
+    
+    if (dtype != NVME_DIRECTIVE_DATA_PLACEMENT || !nvme_parse_pid(ns, pid, &ph, &rg))
+    {
+        ph = 0;
+        rg = 0;
+    }
+    
+    ruhid = ns->fdp_ns.phs[ph];
+    ru = &ns->endgrps.fdp.ruhs[ruhid].rus[rg];
+    nvme_fdp_stat_inc(&ns->endgrps.fdp.hbmw, data_size);
+    nvme_fdp_stat_inc(&ns->endgrps.fdp.mbmw, data_size);
+    
+    while (nlb) {
+        if (nlb < ru->ruamw) {
+//	    printk("works here !!!\r\n");
+            ru->ruamw -= nlb;
+            break;
+        }
+
+        nlb -= ru->ruamw;
+        nvme_update_ruh(ns, pid);
+    }
+    
+
+   // printk("ru->ruamw : %lld, nlb : %lld\r\n",ru->ruamw, nlb);
+   // printk("ruhid : %d rg : %d\n",ruhid, rg);
+}
+
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
@@ -957,6 +1695,63 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		return false;
 	}
 
+	if (ns->endgrps.fdp.enabled == true) { //update~
+                nvme_do_write_fdp(ns, req, nr_lba);
+		//printk("nlb : %lld\r\n", nr_lba);
+        }
+
+	bool fdp_enabled = ns->endgrps.fdp.enabled;
+        printk("fdp enabled : %d\n",fdp_enabled);
+        //bool fdp_enabled = false;
+        uint64_t nlb = nr_lba;
+        const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(0);
+        const uint8_t data_shift = 9;
+        uint64_t data_size = (uint64_t)nlb << data_shift;
+
+        uint32_t dw12 = le32_to_cpu(cmd->fdp_cmd.cdw12);
+        uint8_t dtype = (dw12 >> 20) & 0xf;
+        uint16_t pid = le16_to_cpu(cmd->rw.dspec);	//Placement Identifier
+    	uint16_t rgid = (pid >> 10) & 0x3F;		//Reclaim Group ID
+       	uint16_t ph = pid & 0x3FF;			//Placement Handle
+        uint16_t ruhid;					//Reclaim Unit Handler Identifier
+							// == Placement Identifier
+
+        int r = 0;
+	printk("ph = %d, rgid = %d\n", ph, rgid);
+
+	if (dtype != NVME_DIRECTIVE_DATA_PLACEMENT) {
+                ph = 0;
+                rgid = 0; // TODO: consider striping later
+        }
+
+	ruhid = ns->fdp_ns.phs[ph];	//phs[i] = i
+        if (end_lpn >= spp->tt_pgs) {
+                NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, tt_pgs=%d\r\n", __func__, start_lpn, ssd->sp.tt_pgs);
+        }
+	if (fdp_enabled) {      //update~
+                // perform GC here until !should_fdp_gc(ssd, rgid) 
+                while (should_fdp_gc_high(conv_ftl, rgid)) {
+#ifdef FDP_DEBUG
+                        NVMEV_DEBUG_VERBOSE("do_fdp_gc() called in high\n");
+#endif
+                        spp->tt_valid_pgs -= spp->pgs_per_ru;
+                        r = do_fdp_gc(conv_ftl, rgid, true, req);
+#ifdef DEVICE_UTIL_DEBUG
+#endif
+                        if (r == -1)
+                                break;
+                }
+
+        }                                       //~update
+        else {
+                // perform GC here until !should_gc(ssd) 
+                while (should_gc_high(conv_ftl)) {
+                        r = do_gc(conv_ftl, true);
+                        if (r == -1)
+                                break;
+                }
+        }
+
 	allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
 	if (allocated_buf_size < LBA_TO_BYTE(nr_lba))
 		return false;
@@ -972,31 +1767,40 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		uint64_t nsecs_completed = 0;
 		struct ppa ppa;
 
-		conv_ftl = &conv_ftls[lpn % nr_parts];
+		//conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
 		ppa = get_maptbl_ent(
 			conv_ftl, local_lpn); // Check whether the given LPN has been written before
 		if (mapped_ppa(&ppa)) {
-			/* update old page information first */
+			// update old page information first 
 			mark_page_invalid(conv_ftl, &ppa);
 			set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
 			NVMEV_DEBUG("%s: %lld is invalid, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		}
 
-		/* new write */
-		ppa = get_new_page(conv_ftl, USER_IO);
-		/* update maptbl */
+		// new write 
+		//ppa = get_new_page(conv_ftl, USER_IO);
+		ppa = (fdp_enabled ? fdp_get_new_page(conv_ftl, USER_IO, rgid, ruhid) : get_new_page(conv_ftl, USER_IO));
+		printk("ch : %d, lun : %d, pg : %d, blk : %d, pl : %d\r\n", ppa.g.ch, ppa.g.lun, ppa.g.pg, ppa.g.blk, ppa.g.pl);
+		// update maptbl 
 		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+		printk("set_maptbl_ent\r\n");
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
-		/* update rmap */
+		// update rmap 
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
-
+		printk("set_reverse_maptbl_ent\r\n");
 		mark_page_valid(conv_ftl, &ppa);
+		printk("mark_page_valid\r\n");
+		// need to advance the write pointer here 
+		//advance_write_pointer(conv_ftl, USER_IO);
+		if (fdp_enabled)  {
+                        advance_fdp_write_pointer(conv_ftl, USER_IO, rgid, ruhid);
+                }
+                else {
+                        advance_write_pointer(conv_ftl, USER_IO);
+                }
 
-		/* need to advance the write pointer here */
-		advance_write_pointer(conv_ftl, USER_IO);
-
-		/* Aggregate write io in flash page */
+		// Aggregate write io in flash page 
 		if (last_pg_in_wordline(conv_ftl, &ppa)) {
 			swr.ppa = &ppa;
 
@@ -1012,14 +1816,13 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	}
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
-		/* Wait all flash operations */
+		// Wait all flash operations 
 		ret->nsecs_target = nsecs_latest;
 	} else {
-		/* Early completion */
+		 //Early completion 
 		ret->nsecs_target = nsecs_xfer_completed;
 	}
 	ret->status = NVME_SC_SUCCESS;
-
 	return true;
 }
 
@@ -1060,6 +1863,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 	case nvme_cmd_flush:
 		conv_flush(ns, req, ret);
 		break;
+	case nvme_cmd_io_mgmt_send:	//update to do ~
+		break;
+	case nvme_cmd_io_mgmt_recv:
+		break;			//~ udpate to do
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,
 				nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);

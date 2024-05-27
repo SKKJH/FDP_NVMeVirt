@@ -68,6 +68,15 @@
 #define BITMASK64_ALL (0xFFFFFFFFFFFFFFFF)
 #define ASSERT(X)
 
+#define NVME_FDP_MAX_EVENTS 	63                  //update~
+#define NVME_FDP_MAXPIDS        128                     
+#define NVME_MAX_NAMESPACES 	256                   
+#define NVME_MAX_ENDGRPS        1                       
+#define MAX_RUHS                8                       
+#define RG_DEGREE               4                    
+
+#define NVME_ID_NS_FLBAS_INDEX(flbas)       ((flbas & 0xf))             //update
+
 #include "ssd_config.h"
 
 struct nvmev_sq_stat {
@@ -199,6 +208,15 @@ struct nvmev_io_worker {
 };
 
 struct nvmev_dev {
+
+	// update ~
+	
+	unsigned int time_stamp;                //update
+        unsigned int fdp_mode;                  //update
+        unsigned int fdp_events;                //update
+
+	//  ~ update
+
 	struct pci_bus *virt_bus;
 	void *virtDev;
 	struct pci_header *pcihdr;
@@ -259,11 +277,76 @@ struct nvmev_result {
 	uint64_t nsecs_target;
 };
 
+struct NvmeFdpEvent { //update~
+    uint8_t  type;
+    uint8_t  flags;
+    uint16_t pid;
+    uint64_t timestamp;
+    uint32_t nsid;
+    uint64_t type_specific[2];
+    uint16_t rgid;
+    uint8_t  ruhid;
+    uint8_t  rsvd35[5];
+    uint64_t vendor[3];
+};
+
+struct NvmeFdpEventBuffer {
+    struct NvmeFdpEvent     events[NVME_FDP_MAX_EVENTS];
+    unsigned int     nelems;
+    unsigned int     start;
+    unsigned int     next;
+};
+
+struct NvmeReclaimUnit {
+    uint64_t ruamw;
+};
+
+struct NvmeRuHandle {
+    uint8_t  ruht;                      // initially isolated or persistently isolated
+    uint8_t  ruha;                      // host specified or controller specified
+    uint64_t event_filter;
+    uint8_t  lbafi;
+    uint64_t ruamw;                     // reclaim unit available media writes(remaining sectors)
+
+    /* reclaim units indexed by reclaim group */
+    struct NvmeReclaimUnit *rus;
+};
+
+struct NvmeEnduranceGroup {
+    uint8_t event_conf;
+
+    struct fdp {
+        struct NvmeFdpEventBuffer host_events, ctrl_events;
+
+        uint16_t nruh;
+        uint16_t nrg;
+        uint8_t  rgif;
+        uint64_t runs;
+
+        uint64_t hbmw;
+        uint64_t mbmw;
+        uint64_t mbe;
+
+        bool enabled;
+
+        struct NvmeRuHandle *ruhs;
+    } fdp;
+};
+
 struct nvmev_ns {
 	uint32_t id;
 	uint32_t csi;
 	uint64_t size;
 	void *mapped;
+
+	struct NvmeEnduranceGroup endgrps;
+        unsigned int num_endgrps;               //update
+	struct fdp_ns {
+                char    *ruhs;
+                uint16_t nphs;
+                /* reclaim unit handle identifiers indexed by placement handle */
+                uint16_t *phs;
+        } fdp_ns;
 
 	/*conv ftl or zns or kv*/
 	uint32_t nr_parts; // partitions

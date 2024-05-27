@@ -70,7 +70,8 @@ enum {
 #define MDTS (6)
 #define CELL_MODE (CELL_MODE_MLC)
 
-#define SSD_PARTITIONS (4)
+//#define SSD_PARTITIONS (4)
+#define SSD_PARTITIONS (1)
 #define NAND_CHANNELS (8)
 #define LUNS_PER_NAND_CH (2)
 #define PLNS_PER_LUN (1)
