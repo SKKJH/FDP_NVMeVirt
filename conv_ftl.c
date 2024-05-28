@@ -171,7 +171,6 @@ static void init_write_flow_control(struct conv_ftl *conv_ftl)
 
 static inline void check_addr(int a, int max)
 {
-	printk("a : %d\r\n",a);
 	NVMEV_ASSERT(a >= 0 && a < max);
 }
 
@@ -251,8 +250,6 @@ static void advance_fdp_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_typ
         int max_ch = (rgid + 1) * (RG_DEGREE / spp->luns_per_ch);
         int ruid;
         struct ru *ru = NULL;
-	printk("get advance_fdp_write_pointer metadata \r\n");
-
 	if (io_type == GC_IO) {
                 if (ruh->ruht == NVME_RUHT_INITIALLY_ISOLATED) {
                         ruid = rum->ii_gc_ruid;
@@ -473,14 +470,11 @@ static struct ppa fdp_get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type, 
 
         rum = &conv_ftl->ssd->rums[rgid];
         ru = &rum->rus[ruid];
-	printk("\n20\n");
-	//printk("ch : %d, lun : %d, pg : %d, blk : %d, pl : %d\r\n", ru->wp.ch, ru->wp.lun, ru->wp.pg, ru->wp.blk, ru->wp.pl);
         ppa.g.ch = ru->wp.ch;
         ppa.g.lun = ru->wp.lun;
         ppa.g.pg = ru->wp.pg;
         ppa.g.blk = ru->wp.blk;
         ppa.g.pl = ru->wp.pl;
-	printk("\n21\n");
         return ppa;
 }
 
@@ -1687,7 +1681,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		.interleave_pci_dma = false,
 		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 	};
-
 	NVMEV_DEBUG_VERBOSE("%s: start_lpn=%lld, len=%lld, end_lpn=%lld", __func__, start_lpn, nr_lba, end_lpn);
 	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
 		NVMEV_ERROR("%s: lpn passed FTL range (start_lpn=%lld > tt_pgs=%ld)\n",
@@ -1697,22 +1690,20 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	if (ns->endgrps.fdp.enabled == true) { //update~
                 nvme_do_write_fdp(ns, req, nr_lba);
-		//printk("nlb : %lld\r\n", nr_lba);
         }
 
 	bool fdp_enabled = ns->endgrps.fdp.enabled;
-        printk("fdp enabled : %d\n",fdp_enabled);
-        //bool fdp_enabled = false;
         uint64_t nlb = nr_lba;
         const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(0);
         const uint8_t data_shift = 9;
         uint64_t data_size = (uint64_t)nlb << data_shift;
-
+	
+	uint16_t rgif = ns->endgrps.fdp.rgif;
         uint32_t dw12 = le32_to_cpu(cmd->fdp_cmd.cdw12);
         uint8_t dtype = (dw12 >> 20) & 0xf;
         uint16_t pid = le16_to_cpu(cmd->rw.dspec);	//Placement Identifier
-    	uint16_t rgid = (pid >> 10) & 0x3F;		//Reclaim Group ID
-       	uint16_t ph = pid & 0x3FF;			//Placement Handle
+    	uint16_t rgid = pid >> (16 - rgif);		//Reclaim Group ID
+       	uint16_t ph = pid & ((1 << (15 - rgif)) - 1);	//Placement Handle
         uint16_t ruhid;					//Reclaim Unit Handler Identifier
 							// == Placement Identifier
 
@@ -1781,16 +1772,13 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		// new write 
 		//ppa = get_new_page(conv_ftl, USER_IO);
 		ppa = (fdp_enabled ? fdp_get_new_page(conv_ftl, USER_IO, rgid, ruhid) : get_new_page(conv_ftl, USER_IO));
-		printk("ch : %d, lun : %d, pg : %d, blk : %d, pl : %d\r\n", ppa.g.ch, ppa.g.lun, ppa.g.pg, ppa.g.blk, ppa.g.pl);
+		printk("fdp_get_new_page \nch : %d, lun : %d, pg : %d, blk : %d, pl : %d\r\n", ppa.g.ch, ppa.g.lun, ppa.g.pg, ppa.g.blk, ppa.g.pl);
 		// update maptbl 
 		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
-		printk("set_maptbl_ent\r\n");
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		// update rmap 
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
-		printk("set_reverse_maptbl_ent\r\n");
 		mark_page_valid(conv_ftl, &ppa);
-		printk("mark_page_valid\r\n");
 		// need to advance the write pointer here 
 		//advance_write_pointer(conv_ftl, USER_IO);
 		if (fdp_enabled)  {
@@ -1822,8 +1810,74 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		 //Early completion 
 		ret->nsecs_target = nsecs_xfer_completed;
 	}
+	
 	ret->status = NVME_SC_SUCCESS;
 	return true;
+}
+
+#define prp_address_offset(prp, offset) \
+        (page_address(pfn_to_page(prp >> PAGE_SHIFT) + offset) + (prp & ~PAGE_MASK))
+#define prp_address(prp) prp_address_offset(prp, 0)
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+static void nvme_io_mgmt_recv_ruhs(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret, size_t len)
+{
+	struct nvme_command *cmd = req->cmd;
+	struct NvmeEnduranceGroup *endgrp;
+    	struct NvmeRuhStatus *hdr;
+    	struct NvmeRuhStatusDescr *ruhsd;
+
+	unsigned int nruhsd;
+    	uint16_t rg, ph, *ruhid;
+    	size_t trans_len;
+    	uint8_t *buf = NULL;  // A buffer to be transmitted to host
+        uint64_t prp1 = le64_to_cpu(cmd->fdp_cmd.dptr.prp1); //update
+        uint64_t prp2 = le64_to_cpu(cmd->fdp_cmd.dptr.prp2); //update
+	void *page;	
+	page = prp_address(prp1);
+	endgrp = &ns->endgrps;
+	nruhsd = ns->fdp_ns.nphs * endgrp->fdp.nrg;
+	trans_len = sizeof(struct NvmeRuhStatus) + nruhsd * sizeof(struct NvmeRuhStatusDescr);
+	buf = kzalloc(sizeof(size_t), GFP_KERNEL);
+	trans_len = MIN(trans_len, len);
+	hdr = (struct NvmeRuhStatus *)buf; // Start Address of RUHS
+    	ruhsd = (struct NvmeRuhStatusDescr *)(buf + sizeof(struct NvmeRuhStatus)); // Start Address of RUHSD
+	hdr->nruhsd = cpu_to_le16(nruhsd);
+	ruhid = ns->fdp_ns.phs;
+	for (ph = 0; ph < ns->fdp_ns.nphs; ph++, *ruhid++) {
+            struct NvmeRuHandle *ruh = &endgrp->fdp.ruhs[*ruhid];
+        for (rg = 0; rg < endgrp->fdp.nrg; rg++, ruhsd++) {
+            uint16_t pid = nvme_make_pid(ns, rg, ph);
+            ruhsd->pid = cpu_to_le16(pid);
+            ruhsd->ruhid = *ruhid;
+            ruhsd->earutr = 0;
+            ruhsd->ruamw = cpu_to_le64(ruh->rus[rg].ruamw);
+        }
+    }
+   __memcpy(page, buf, trans_len); 	
+}
+
+static void conv_io_mgmt_recv(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
+{
+    struct nvme_command *cmd = req->cmd;
+    uint32_t cdw10 = le32_to_cpu(cmd->fdp_cmd.cdw10);
+    uint32_t numd = le32_to_cpu(cmd->fdp_cmd.cdw11);
+    uint8_t mo = (cdw10 & 0xff); // Management operation
+    size_t len = (numd + 1) << 2; // unit: byte
+    
+    //printk("mo : 0x%x\r\n",mo);
+    switch (mo) {
+    case NVME_IOMR_MO_NOP:
+        break;
+    case NVME_IOMR_MO_RUH_STATUS:
+        nvme_io_mgmt_recv_ruhs(ns, req, ret, len);
+	break;
+    default:
+        break;
+    };
 }
 
 static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
@@ -1848,11 +1902,10 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct nvme_command *cmd = req->cmd;
-
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
 	switch (cmd->common.opcode) {
-	case nvme_cmd_write:
+	case (nvme_cmd_write):
 		if (!conv_write(ns, req, ret))
 			return false;
 		break;
@@ -1866,6 +1919,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 	case nvme_cmd_io_mgmt_send:	//update to do ~
 		break;
 	case nvme_cmd_io_mgmt_recv:
+		conv_io_mgmt_recv(ns, req, ret);
 		break;			//~ udpate to do
 	default:
 		NVMEV_ERROR("%s: command not implemented: %s (0x%x)\n", __func__,

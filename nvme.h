@@ -461,6 +461,7 @@ struct nvme_reservation_status {
 	op(nvme_cmd_io_mgmt_recv, 0x12) \
 	op(nvme_cmd_copy, 0x19) \
 	op(nvme_cmd_io_mgmt_send, 0x1d) \
+	op(nvme_cmd_fdp, 0x18) \
 
 #define ENUM_NVME_OP(name, value) name = value,
 #define STRING_NVME_OP(name, value) [name] = #name,

@@ -552,6 +552,9 @@ static void __nvmev_admin_identify(int eid)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	int cns = sq_entry(eid).identify.cns;
 
+	printk("%s: %d 0x%d\n", __func__, eid,
+                        cns);
+
 	switch (cns) {
 	case 0x00:
 		__nvmev_admin_identify_namespace(eid);

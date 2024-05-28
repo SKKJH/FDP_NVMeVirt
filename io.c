@@ -91,7 +91,7 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		}
 
 		if (cmd->opcode == nvme_cmd_write ||
-		    cmd->opcode == nvme_cmd_zone_append) {
+		    cmd->opcode == nvme_cmd_zone_append || cmd->opcode == nvme_cmd_fdp) {
 			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
 			memcpy(vaddr + mem_offs, nvmev_vdev->ns[nsid].mapped + offset, io_size);
